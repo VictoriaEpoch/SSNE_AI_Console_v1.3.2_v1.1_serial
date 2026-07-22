@@ -1,0 +1,1 @@
+# Windows 串口连接已内置，无需安装 pyserial。

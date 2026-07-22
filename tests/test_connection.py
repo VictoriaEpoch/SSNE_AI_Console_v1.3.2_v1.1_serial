@@ -50,7 +50,7 @@ def test_connection_thread():
         deadline = time.time() + 1
         while (not fake.writes or not lines) and time.time() < deadline:
             time.sleep(0.01)
-        assert fake.writes == [b"status\n"]
+        assert fake.writes == [b"status\r\n"]
         assert lines == ["[SERIAL][STATUS] frame=1"]
         assert any(state == "opened" for state, _message in states)
         conn.close()

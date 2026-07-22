@@ -1,1 +1,3 @@
 # Windows 串口连接已内置，无需安装 pyserial。
+# Pillow 用于屏幕区域截取、图片导入和危险区多边形预览。
+Pillow>=10.0

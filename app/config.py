@@ -13,11 +13,23 @@ COLORS = {
 
 FALL_STATUS = {
     "NO_PERSON": ("无人", "muted"),
+    "NP": ("无人", "muted"),
     "LOST_TARGET": ("目标丢失", "warning"),
+    "LT": ("目标丢失", "warning"),
     "TRACKING": ("跟踪中", "cyan"),
+    "TR": ("跟踪中", "cyan"),
     "NORMAL": ("正常", "success"),
+    "NM": ("正常", "success"),
     "PRE_FALL": ("预跌倒", "warning"),
+    "PF": ("预跌倒", "warning"),
     "FALL": ("跌倒告警", "danger"),
+    "FL": ("跌倒告警", "danger"),
+}
+
+POSTURE_STATUS = {
+    0: ("躺卧", "warning"),
+    1: ("坐姿", "cyan"),
+    2: ("站立", "success"),
 }
 
 OSD_MODES = ("BASE", "HAND", "FACE", "POSE", "ALL")

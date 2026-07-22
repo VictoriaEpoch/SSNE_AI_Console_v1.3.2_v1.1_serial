@@ -348,7 +348,7 @@ def _open_serial_port(port: str, baudrate: int):
 
 
 class SerialConnection:
-    """v1.1 风格的简单串口连接：固定 8-N-1，命令以 LF 结尾。"""
+    """Simple 8-N-1 serial connection matching the reference UART client."""
 
     def __init__(
         self,
@@ -433,7 +433,9 @@ class SerialConnection:
                 try:
                     while True:
                         command = self._tx_queue.get_nowait()
-                        packet = (command + "\n").encode("utf-8")
+                        # The reference uart_command_client.py uses CRLF. The board
+                        # reads through std::getline and trims the remaining CR.
+                        packet = (command + "\r\n").encode("utf-8")
                         serial_port.write(packet)
                         serial_port.flush()
                         self.stats.tx_bytes += len(packet)

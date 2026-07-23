@@ -1,12 +1,13 @@
 from datetime import datetime
 
-from app.commands import build_enroll, build_zone_set
+from app.commands import build_enroll, build_zone_rect, build_zone_set
 from app.monitoring import NightRiseMonitor, SedentaryMonitor
 
 
 def test_commands():
     command = build_zone_set([(0.1, 0.2), (0.8, 0.2), (0.5, 0.9)])
     assert command == "zone set 0.100000 0.200000 0.800000 0.200000 0.500000 0.900000"
+    assert build_zone_rect(0.2, 0.2, 0.8, 0.8) == "zone rect 0.200000 0.200000 0.800000 0.800000"
     assert build_enroll("u1", "alice", 20) == "reg u1 alice 20"
 
     for invalid in ([], [(0, 0), (1, 1)], [(0, 0), (1, 0), (2, 1)]):

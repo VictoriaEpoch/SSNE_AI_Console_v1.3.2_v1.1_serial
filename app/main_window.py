@@ -8,7 +8,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Dict, Optional
 
-from .commands import build_enroll, build_zone_set
+from .commands import build_enroll, build_zone_rect, build_zone_set
 from .config import (
     APP_NAME,
     APP_VERSION,
@@ -527,10 +527,11 @@ class MainWindow:
                 ("启用", lambda: self.send_command("zone on")),
                 ("停用", lambda: self.send_command("zone off")),
                 ("查询", lambda: self.send_command("zone list")),
+                ("测试矩形", self.send_test_zone_rect),
                 ("清空区域", self.clear_zone),
             )
         ):
-            style = "Primary.TButton" if index == 0 else ("Danger.TButton" if index == 4 else "TButton")
+            style = "Primary.TButton" if index == 0 else ("Danger.TButton" if label == "清空区域" else "TButton")
             ttk.Button(buttons, text=label, style=style, command=command).pack(side="left", expand=True, fill="x", padx=3)
         self.safety_fields_var = tk.StringVar(value="dza=--  pza=--  dzh=--  pzh=--")
         ttk.Label(right, textvariable=self.safety_fields_var, style="PanelMuted.TLabel", wraplength=820, justify="left").pack(anchor="w")
@@ -1372,6 +1373,16 @@ class MainWindow:
         except ValueError as exc:
             messagebox.showwarning("区域未设置", str(exc))
             return
+        if self.send_command(command):
+            self.send_command("zone on")
+            self.root.after(200, lambda: self.send_command("zone list", quiet=True))
+
+    def send_test_zone_rect(self) -> None:
+        self.zone_points = [(0.2, 0.2), (0.8, 0.2), (0.8, 0.8), (0.2, 0.8)]
+        self._save_user_settings()
+        self._update_zone_summary()
+        self._draw_zone_preview()
+        command = build_zone_rect(0.2, 0.2, 0.8, 0.8)
         if self.send_command(command):
             self.send_command("zone on")
             self.root.after(200, lambda: self.send_command("zone list", quiet=True))

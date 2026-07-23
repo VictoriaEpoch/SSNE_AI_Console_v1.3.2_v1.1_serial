@@ -84,7 +84,32 @@ def test_zone_transfer_timeout():
     assert any("[ZONE][FAILED]" in line for line in window.logs)
 
 
+def test_zone_transfer_accepts_status_confirmation():
+    points = [(0.1, 0.2), (0.8, 0.2), (0.5, 0.9)]
+    commands = build_zone_upload(points)
+    window = make_window()
+    window._start_zone_transfer(commands, len(points))
+
+    replies = [
+        "[SERIAL][S] f=1 dz=0 dzn=0",
+        "[SERIAL][S] f=2 dz=0 dzn=1",
+        "[SERIAL][S] f=3 dz=0 dzn=2",
+        "[SERIAL][S] f=4 dz=0 dzn=3",
+        "[SERIAL][S] f=5 dz=1 dzn=3",
+        "[SERIAL][S] f=6 dz=1 dzn=3",
+    ]
+    for reply in replies:
+        window._handle_zone_transfer_line(reply)
+        window.root.run_next(ZONE_STEP_DELAY_MS)
+
+    assert window.sent == commands
+    assert not window._zone_transfer_active
+    assert "成功" in window.zone_transfer_status_var.value
+    assert sum("状态字段 dz/dzn" in line for line in window.logs) == len(replies)
+
+
 if __name__ == "__main__":
     test_acknowledged_zone_transfer()
     test_zone_transfer_timeout()
+    test_zone_transfer_accepts_status_confirmation()
     print("zone-transfer test passed")

@@ -85,7 +85,7 @@ HOME_DEFAULT_RELEASE_SECONDS = 0.60
 HOME_DEFAULT_HOLD_SECONDS = 2.5
 HOME_RESPONSE_PROFILE_VERSION = 2
 ZONE_STEP_DELAY_MS = 120
-ZONE_STEP_TIMEOUT_MS = 2000
+ZONE_STEP_TIMEOUT_MS = 6000
 
 
 class MainWindow:
@@ -1534,8 +1534,14 @@ class MainWindow:
             return
 
         _command, expected, _progress = self._zone_transfer_steps[self._zone_transfer_index]
-        if expected not in cleaned:
+        text_confirmed = expected in cleaned
+        status_confirmed = self._zone_status_confirms_transfer_step(line)
+        if not text_confirmed and not status_confirmed:
             return
+        if status_confirmed and not text_confirmed:
+            self._append_log(
+                f"[ZONE] 已通过状态字段 dz/dzn 确认：{_command}"
+            )
 
         self._zone_transfer_waiting = False
         completed_index = self._zone_transfer_index
@@ -1553,6 +1559,28 @@ class MainWindow:
             ZONE_STEP_DELAY_MS,
             lambda: self._send_zone_transfer_step(generation),
         )
+
+    def _zone_status_confirms_transfer_step(self, line: str) -> bool:
+        event = parse_line(line)
+        if event is None or event.kind != "status":
+            return False
+        if "dz" not in event.data or "dzn" not in event.data:
+            return False
+        try:
+            point_count = int(event.data["dzn"])
+        except (TypeError, ValueError):
+            return False
+
+        command = self._zone_transfer_steps[self._zone_transfer_index][0]
+        enabled = _as_bool(event.data["dz"])
+        if command == "zone clear":
+            return not enabled and point_count == 0
+        if command.startswith("zone add "):
+            expected_added_points = self._zone_transfer_index
+            return not enabled and point_count == expected_added_points
+        if command in {"zone on", "zone list"}:
+            return enabled and point_count == self._zone_transfer_expected_points
+        return False
 
     def _zone_transfer_timeout(self, generation: int, step_index: int) -> None:
         if (

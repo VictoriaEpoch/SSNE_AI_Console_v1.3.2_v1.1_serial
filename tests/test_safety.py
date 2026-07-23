@@ -2,6 +2,7 @@ from datetime import datetime
 
 from app.commands import (
     MAX_COMMAND_CHARS,
+    MAX_DECIMAL_PLACES,
     build_benchmark,
     build_enroll,
     build_print_interval,
@@ -18,16 +19,49 @@ def test_commands():
     assert build_zone_rect(0, 0, 1, 1) == "zone rect 0 0 1 1"
     assert build_zone_upload([(0.1, 0.2), (0.8, 0.2), (0.5, 0.9)]) == [
         "zone clear",
-        "zone add 0.1000 0.2000",
-        "zone add 0.8000 0.2000",
-        "zone add 0.5000 0.9000",
+        "zone add 0.1 0.2",
+        "zone add 0.8 0.2",
+        "zone add 0.5 0.9",
         "zone on",
         "zone list",
     ]
     assert build_enroll("u1", "alice", 20) == "reg u1 alice 20"
-    assert build_print_interval(120) == "set print_interval 120"
+    assert build_enroll("u1", "alice", 15) == "reg u1 alice"
+    assert build_print_interval(120) == "pi120"
     assert build_benchmark("each", 60, 30) == "test each 60 30"
+    assert build_benchmark("all", 60, 29.976) == "test all 60 29.98"
+    assert build_zone_upload([(0.1234, 0.9876), (0.5, 0.25), (1, 0)])[1] == (
+        "zone add 0.12 0.99"
+    )
+    assert MAX_DECIMAL_PLACES == 2
     assert validate_command("x" * MAX_COMMAND_CHARS) == "x" * MAX_COMMAND_CHARS
+    fixed_commands = (
+        "help",
+        "pro",
+        "status",
+        "debug",
+        "debug on",
+        "debug off",
+        "bg on",
+        "bg off",
+        "pk on",
+        "pk off",
+        "scan",
+        "base",
+        "hand",
+        "face",
+        "pose",
+        "all",
+        "reg cancel",
+        "test stop",
+        "zone",
+        "zone on",
+        "zone off",
+        "zone clear",
+        "zone pop",
+        "zone list",
+    )
+    assert all(validate_command(command) == command for command in fixed_commands)
     assert all(
         len(command) <= MAX_COMMAND_CHARS
         and len(command.encode("utf-8")) <= MAX_COMMAND_CHARS
@@ -47,6 +81,8 @@ def test_commands():
         "reg u1234567890 abcdef 120",
         "set print_interval 100000",
         "测试命令测试命令测试命令",
+        "pa0.123",
+        "zone add 0.123 0.5",
     ):
         try:
             validate_command(invalid_command)
@@ -56,7 +92,7 @@ def test_commands():
 
     for builder, args in (
         (build_enroll, ("u1234567890", "abcdef", 120)),
-        (build_print_interval, (100000,)),
+        (build_print_interval, (10**22,)),
         (build_benchmark, ("each", 123456789012, 30)),
         (build_zone_rect, (0.2, 0.2, 0.8, 0.8)),
     ):

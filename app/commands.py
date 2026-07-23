@@ -1,40 +1,16 @@
 from __future__ import annotations
 
 import math
-import re
 from collections.abc import Iterable
 
 
 MAX_ZONE_POINTS = 12
 MAX_COMMAND_CHARS = 24
-MAX_DECIMAL_PLACES = 2
-DECIMAL_TOKEN_RE = re.compile(
-    r"^[+-]?(?:\d+\.(?P<fraction>\d*)|\.(?P<leading_fraction>\d+))(?:[eE][+-]?\d+)?$"
-)
-COMPACT_DECIMAL_RE = re.compile(
-    r"^(?:pa|pp|ps|ph|fr|fd|fi|pi|di)"
-    r"(?P<number>[+-]?(?:\d+\.\d+|\.\d+)(?:[eE][+-]?\d+)?)$",
-    re.IGNORECASE,
-)
+ZONE_DECIMAL_PLACES = 4
 
 
-def _decimal_places(token: str) -> int:
-    match = DECIMAL_TOKEN_RE.fullmatch(token)
-    if match is None:
-        compact = COMPACT_DECIMAL_RE.fullmatch(token)
-        if compact is None:
-            return 0
-        match = DECIMAL_TOKEN_RE.fullmatch(compact.group("number"))
-    if match is None:
-        return 0
-    fraction = match.group("fraction")
-    if fraction is None:
-        fraction = match.group("leading_fraction") or ""
-    return len(fraction)
-
-
-def _format_decimal(value: float) -> str:
-    formatted = f"{float(value):.{MAX_DECIMAL_PLACES}f}".rstrip("0").rstrip(".")
+def _format_zone_coordinate(value: float) -> str:
+    formatted = f"{float(value):.{ZONE_DECIMAL_PLACES}f}".rstrip("0").rstrip(".")
     return "0" if formatted in {"-0", "+0", ""} else formatted
 
 
@@ -45,12 +21,6 @@ def validate_command(command: str) -> str:
         raise ValueError("串口命令不能为空。")
     if "\r" in normalized or "\n" in normalized:
         raise ValueError("一条串口命令中不能包含换行符。")
-    for token in normalized.split():
-        places = _decimal_places(token)
-        if places > MAX_DECIMAL_PLACES:
-            raise ValueError(
-                f"小数参数 {token!r} 有 {places} 位小数，最多允许 {MAX_DECIMAL_PLACES} 位。"
-            )
     char_length = len(normalized)
     byte_length = len(normalized.encode("utf-8"))
     if char_length > MAX_COMMAND_CHARS or byte_length > MAX_COMMAND_CHARS:
@@ -80,7 +50,7 @@ def build_zone_set(points: Iterable[tuple[float, float]]) -> str:
         raise ValueError("危险区域至少需要 3 个点。")
     if len(normalized) > MAX_ZONE_POINTS:
         raise ValueError(f"危险区域最多支持 {MAX_ZONE_POINTS} 个点。")
-    values = " ".join(_format_decimal(value) for point in normalized for value in point)
+    values = " ".join(_format_zone_coordinate(value) for point in normalized for value in point)
     return validate_command(f"zone set {values}")
 
 
@@ -88,7 +58,7 @@ def build_zone_rect(x1: float, y1: float, x2: float, y2: float) -> str:
     """Build a zone-rect command only when its compact form fits the UART limit."""
     first = _validate_unit_point(x1, y1)
     second = _validate_unit_point(x2, y2)
-    values = " ".join(_format_decimal(value) for value in (*first, *second))
+    values = " ".join(_format_zone_coordinate(value) for value in (*first, *second))
     return validate_command(f"zone rect {values}")
 
 
@@ -101,7 +71,7 @@ def build_zone_upload(points: Iterable[tuple[float, float]]) -> list[str]:
         raise ValueError(f"危险区域最多支持 {MAX_ZONE_POINTS} 个点。")
     commands = [validate_command("zone clear")]
     commands.extend(
-        validate_command(f"zone add {_format_decimal(x)} {_format_decimal(y)}")
+        validate_command(f"zone add {_format_zone_coordinate(x)} {_format_zone_coordinate(y)}")
         for x, y in normalized
     )
     commands.extend(("zone on", "zone list"))
@@ -139,4 +109,4 @@ def build_benchmark(mode: str, seconds: int, sensor_fps: float) -> str:
     sensor_fps = float(sensor_fps)
     if seconds <= 0 or not math.isfinite(sensor_fps) or sensor_fps <= 0:
         raise ValueError("测试秒数和传感器 FPS 必须大于 0。")
-    return validate_command(f"test {mode} {seconds} {_format_decimal(sensor_fps)}")
+    return validate_command(f"test {mode} {seconds} {sensor_fps:g}")

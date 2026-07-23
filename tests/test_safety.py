@@ -2,7 +2,7 @@ from datetime import datetime
 
 from app.commands import (
     MAX_COMMAND_CHARS,
-    MAX_DECIMAL_PLACES,
+    ZONE_DECIMAL_PLACES,
     build_benchmark,
     build_enroll,
     build_print_interval,
@@ -29,11 +29,11 @@ def test_commands():
     assert build_enroll("u1", "alice", 15) == "reg u1 alice"
     assert build_print_interval(120) == "pi120"
     assert build_benchmark("each", 60, 30) == "test each 60 30"
-    assert build_benchmark("all", 60, 29.976) == "test all 60 29.98"
+    assert build_benchmark("all", 60, 29.976) == "test all 60 29.976"
     assert build_zone_upload([(0.1234, 0.9876), (0.5, 0.25), (1, 0)])[1] == (
-        "zone add 0.12 0.99"
+        "zone add 0.1234 0.9876"
     )
-    assert MAX_DECIMAL_PLACES == 2
+    assert ZONE_DECIMAL_PLACES == 4
     assert validate_command("x" * MAX_COMMAND_CHARS) == "x" * MAX_COMMAND_CHARS
     fixed_commands = (
         "help",
@@ -81,14 +81,13 @@ def test_commands():
         "reg u1234567890 abcdef 120",
         "set print_interval 100000",
         "测试命令测试命令测试命令",
-        "pa0.123",
-        "zone add 0.123 0.5",
     ):
         try:
             validate_command(invalid_command)
             raise AssertionError("overlong command was accepted")
         except ValueError:
             pass
+    assert validate_command("pa0.12345") == "pa0.12345"
 
     for builder, args in (
         (build_enroll, ("u1234567890", "abcdef", 120)),

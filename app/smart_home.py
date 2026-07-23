@@ -71,9 +71,9 @@ class SmartHomeController:
         self,
         *,
         enabled: bool = True,
-        minimum_score: float = 0.75,
-        confirm_samples: int = 2,
-        release_seconds: float = 1.0,
+        minimum_score: float = 0.50,
+        confirm_samples: int = 1,
+        release_seconds: float = 0.60,
         mapping: Optional[dict[int, str]] = None,
         hold_seconds: float = 0.0,
         hold_mapping: Optional[dict[int, str]] = None,
@@ -92,9 +92,9 @@ class SmartHomeController:
             "tv_volume": 30,
         }
         self.enabled = True
-        self.minimum_score = 0.75
-        self.confirm_samples = 2
-        self.release_seconds = 1.0
+        self.minimum_score = 0.50
+        self.confirm_samples = 1
+        self.release_seconds = 0.60
         self.hold_seconds = 0.0
         self.mapping = dict(DEFAULT_GESTURE_MAPPING)
         self.hold_mapping = {gesture: "none" for gesture in range(5)}

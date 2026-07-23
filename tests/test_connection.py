@@ -53,6 +53,11 @@ def test_connection_thread():
         assert fake.writes == [b"status\r\n"]
         assert lines == ["[SERIAL][STATUS] frame=1"]
         assert any(state == "opened" for state, _message in states)
+        try:
+            conn.send("x" * 25)
+            raise AssertionError("overlong command was queued")
+        except ValueError:
+            pass
         conn.close()
         assert not conn.is_running
     finally:

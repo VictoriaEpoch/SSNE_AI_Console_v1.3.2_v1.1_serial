@@ -8,7 +8,13 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Dict, Optional
 
-from .commands import build_enroll, build_zone_rect, build_zone_set
+from .commands import (
+    build_benchmark,
+    build_enroll,
+    build_print_interval,
+    build_zone_upload,
+    validate_command,
+)
 from .config import (
     APP_NAME,
     APP_VERSION,
@@ -70,6 +76,18 @@ def _format_duration(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
+DEFAULT_STATUS_POLL_MS = 1000
+HOME_STATUS_POLL_MS = 250
+DEBUG_POLL_SECONDS = 1.0
+HOME_DEFAULT_MINIMUM_SCORE = 0.50
+HOME_DEFAULT_CONFIRM_SAMPLES = 1
+HOME_DEFAULT_RELEASE_SECONDS = 0.60
+HOME_DEFAULT_HOLD_SECONDS = 2.5
+HOME_RESPONSE_PROFILE_VERSION = 2
+ZONE_STEP_DELAY_MS = 120
+ZONE_STEP_TIMEOUT_MS = 2000
+
+
 class MainWindow:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -94,8 +112,17 @@ class MainWindow:
         self._fall_active = False
         self._last_alert_key = ""
         self._last_alert_at = 0.0
+        self._serial_poll_paused_until = 0.0
+        self._zone_transfer_active = False
+        self._zone_transfer_steps: list[tuple[str, str, str]] = []
+        self._zone_transfer_index = 0
+        self._zone_transfer_waiting = False
+        self._zone_transfer_generation = 0
+        self._zone_transfer_expected_points = 0
+        self._last_debug_poll_at = 0.0
 
         self.user_settings = load_settings()
+        self._upgrade_home_response_defaults()
         threshold_minutes = _as_float(self.user_settings.get("sedentary_minutes"), 30.0)
         if threshold_minutes <= 0:
             threshold_minutes = 30.0
@@ -157,16 +184,19 @@ class MainWindow:
         try:
             self.home_controller = SmartHomeController(
                 enabled=bool(self.user_settings.get("home_enabled", True)),
-                minimum_score=_as_float(self.user_settings.get("home_minimum_score"), 0.75),
-                confirm_samples=_as_int(self.user_settings.get("home_confirm_samples"), 2),
-                release_seconds=_as_float(self.user_settings.get("home_release_seconds"), 1.0),
+                minimum_score=_as_float(self.user_settings.get("home_minimum_score"), HOME_DEFAULT_MINIMUM_SCORE),
+                confirm_samples=_as_int(self.user_settings.get("home_confirm_samples"), HOME_DEFAULT_CONFIRM_SAMPLES),
+                release_seconds=_as_float(self.user_settings.get("home_release_seconds"), HOME_DEFAULT_RELEASE_SECONDS),
                 mapping=home_mapping,
-                hold_seconds=_as_float(self.user_settings.get("home_hold_seconds"), 2.5),
+                hold_seconds=_as_float(self.user_settings.get("home_hold_seconds"), HOME_DEFAULT_HOLD_SECONDS),
                 hold_mapping=home_hold_mapping,
             )
         except (TypeError, ValueError):
             self.home_controller = SmartHomeController(
-                hold_seconds=2.5,
+                minimum_score=HOME_DEFAULT_MINIMUM_SCORE,
+                confirm_samples=HOME_DEFAULT_CONFIRM_SAMPLES,
+                release_seconds=HOME_DEFAULT_RELEASE_SECONDS,
+                hold_seconds=HOME_DEFAULT_HOLD_SECONDS,
                 hold_mapping=DEFAULT_HOLD_MAPPING,
             )
         self.home_last_status_frame: Optional[int] = None
@@ -177,7 +207,7 @@ class MainWindow:
         self._build(threshold_minutes, sedentary_enabled)
         self.refresh_ports(show_message=False)
         self.root.after(40, self._drain_events)
-        self.root.after(1000, self._status_poll)
+        self.root.after(DEFAULT_STATUS_POLL_MS, self._status_poll)
         self.root.after(500, self._update_health)
 
     @staticmethod
@@ -192,6 +222,29 @@ class MainWindow:
             if 0 <= x <= 1 and 0 <= y <= 1:
                 points.append((x, y))
         return points
+
+    def _upgrade_home_response_defaults(self) -> None:
+        if _as_int(self.user_settings.get("home_response_profile_version"), 0) >= HOME_RESPONSE_PROFILE_VERSION:
+            return
+
+        old_defaults = {
+            "home_minimum_score": 0.75,
+            "home_confirm_samples": 2,
+            "home_release_seconds": 1.0,
+        }
+        new_defaults = {
+            "home_minimum_score": HOME_DEFAULT_MINIMUM_SCORE,
+            "home_confirm_samples": HOME_DEFAULT_CONFIRM_SAMPLES,
+            "home_release_seconds": HOME_DEFAULT_RELEASE_SECONDS,
+        }
+        for key, old_value in old_defaults.items():
+            current = self.user_settings.get(key)
+            if current is None:
+                self.user_settings[key] = new_defaults[key]
+                continue
+            if abs(_as_float(current, old_value) - old_value) < 0.000001:
+                self.user_settings[key] = new_defaults[key]
+        self.user_settings["home_response_profile_version"] = HOME_RESPONSE_PROFILE_VERSION
 
     def _styles(self) -> None:
         style = ttk.Style()
@@ -519,8 +572,11 @@ class MainWindow:
         right.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
         self.zone_device_status_var = tk.StringVar(value="设备区域状态：未知")
         ttk.Label(right, textvariable=self.zone_device_status_var, style="PanelMuted.TLabel", wraplength=820).pack(anchor="w")
+        self.zone_transfer_status_var = tk.StringVar(value="下发状态：待命")
+        ttk.Label(right, textvariable=self.zone_transfer_status_var, style="PanelMuted.TLabel", wraplength=820).pack(anchor="w", pady=(3, 0))
         buttons = ttk.Frame(right, style="Panel.TFrame")
         buttons.pack(fill="x", pady=(8, 8))
+        self.zone_action_buttons = []
         for index, (label, command) in enumerate(
             (
                 ("下发并启用", self._send_zone_points),
@@ -532,7 +588,9 @@ class MainWindow:
             )
         ):
             style = "Primary.TButton" if index == 0 else ("Danger.TButton" if label == "清空区域" else "TButton")
-            ttk.Button(buttons, text=label, style=style, command=command).pack(side="left", expand=True, fill="x", padx=3)
+            button = ttk.Button(buttons, text=label, style=style, command=command)
+            button.pack(side="left", expand=True, fill="x", padx=3)
+            self.zone_action_buttons.append(button)
         self.safety_fields_var = tk.StringVar(value="dza=--  pza=--  dzh=--  pzh=--")
         ttk.Label(right, textvariable=self.safety_fields_var, style="PanelMuted.TLabel", wraplength=820, justify="left").pack(anchor="w")
         ttk.Label(
@@ -877,6 +935,8 @@ class MainWindow:
             self._set_link("连接失败", COLORS["danger"])
             messagebox.showerror("串口连接失败", message)
         elif state == "closed":
+            if self._zone_transfer_active:
+                self._fail_zone_transfer("串口连接已断开")
             self.connection = None
             self.connect_btn.configure(text="连接", style="Primary.TButton")
             self._set_controls_connected(False)
@@ -884,6 +944,7 @@ class MainWindow:
 
     def _handle_line(self, line: str) -> None:
         self._append_log(line)
+        self._handle_zone_transfer_line(line)
         event = parse_line(line)
         if not event:
             return
@@ -1030,7 +1091,10 @@ class MainWindow:
             self.home_mapping_vars[gesture_class].set(ACTION_LABELS[action])
         for gesture_class, action in DEFAULT_HOLD_MAPPING.items():
             self.home_hold_mapping_vars[gesture_class].set(ACTION_LABELS[action])
-        self.home_hold_seconds_var.set("2.5")
+        self.home_minimum_score_var.set(f"{HOME_DEFAULT_MINIMUM_SCORE:g}")
+        self.home_confirm_samples_var.set(str(HOME_DEFAULT_CONFIRM_SAMPLES))
+        self.home_release_seconds_var.set(f"{HOME_DEFAULT_RELEASE_SECONDS:g}")
+        self.home_hold_seconds_var.set(f"{HOME_DEFAULT_HOLD_SECONDS:g}")
         self.apply_home_settings()
 
     def _manual_home_action(self, action: str) -> None:
@@ -1091,6 +1155,13 @@ class MainWindow:
             pass
 
     def send_command(self, command: str, quiet: bool = False) -> bool:
+        try:
+            command = validate_command(command)
+        except ValueError as exc:
+            self._append_log(f"[TX][BLOCKED] {exc}")
+            if not quiet:
+                messagebox.showerror("命令未发送", str(exc))
+            return False
         if not self.connection:
             if not quiet:
                 messagebox.showwarning("未连接", "请先打开串口。")
@@ -1108,13 +1179,23 @@ class MainWindow:
             self.night_rise_monitor.enabled and self.night_rise_monitor.is_in_schedule()
         )
 
+    def _pause_serial_polling(self, seconds: float) -> None:
+        self._serial_poll_paused_until = max(
+            self._serial_poll_paused_until,
+            time.monotonic() + max(0.0, seconds),
+        )
+
     def _status_poll(self) -> None:
-        if not self._closing and self.connection is not None and self.connection.is_running:
+        now = time.monotonic()
+        poll_paused = now < self._serial_poll_paused_until or self._zone_transfer_active
+        if not poll_paused and not self._closing and self.connection is not None and self.connection.is_running:
             self.send_command("status", quiet=True)
-            if self._posture_poll_required():
+            if self._posture_poll_required() and now - self._last_debug_poll_at >= DEBUG_POLL_SECONDS:
                 self.send_command("debug", quiet=True)
+                self._last_debug_poll_at = now
         if not self._closing:
-            self.root.after(1000, self._status_poll)
+            interval_ms = HOME_STATUS_POLL_MS if self.home_controller.enabled else DEFAULT_STATUS_POLL_MS
+            self.root.after(interval_ms, self._status_poll)
 
     def _update_health(self) -> None:
         if self.connection is not None:
@@ -1249,25 +1330,23 @@ class MainWindow:
 
     def set_interval(self) -> None:
         try:
-            value = int(self.interval_var.get())
-        except ValueError:
-            messagebox.showerror("输入错误", "打印周期必须是正整数。")
+            command = build_print_interval(int(self.interval_var.get()))
+        except (TypeError, ValueError) as exc:
+            messagebox.showerror("输入错误", str(exc))
             return
-        if value <= 0:
-            messagebox.showerror("输入错误", "打印周期必须大于 0。")
-            return
-        self.send_command(f"set print_interval {value}")
+        self.send_command(command)
 
     def start_benchmark(self) -> None:
         try:
-            seconds = int(self.bench_seconds_var.get())
-            sensor_fps = float(self.bench_fps_var.get())
-            if seconds <= 0 or sensor_fps <= 0:
-                raise ValueError
-        except ValueError:
-            messagebox.showerror("输入错误", "测试秒数和传感器 FPS 必须大于 0。")
+            command = build_benchmark(
+                self.bench_mode_var.get(),
+                int(self.bench_seconds_var.get()),
+                float(self.bench_fps_var.get()),
+            )
+        except (TypeError, ValueError) as exc:
+            messagebox.showerror("输入错误", str(exc))
             return
-        self.send_command(f"test {self.bench_mode_var.get()} {seconds} {sensor_fps:g}")
+        self.send_command(command)
 
     def apply_sedentary_settings(self) -> None:
         try:
@@ -1369,23 +1448,144 @@ class MainWindow:
 
     def _send_zone_points(self) -> None:
         try:
-            command = build_zone_set(self.zone_points)
+            commands = build_zone_upload(self.zone_points)
         except ValueError as exc:
             messagebox.showwarning("区域未设置", str(exc))
             return
-        if self.send_command(command):
-            self.send_command("zone on")
-            self.root.after(200, lambda: self.send_command("zone list", quiet=True))
+        self._start_zone_transfer(commands, len(self.zone_points))
 
     def send_test_zone_rect(self) -> None:
         self.zone_points = [(0.2, 0.2), (0.8, 0.2), (0.8, 0.8), (0.2, 0.8)]
         self._save_user_settings()
         self._update_zone_summary()
         self._draw_zone_preview()
-        command = build_zone_rect(0.2, 0.2, 0.8, 0.8)
-        if self.send_command(command):
-            self.send_command("zone on")
-            self.root.after(200, lambda: self.send_command("zone list", quiet=True))
+        self._start_zone_transfer(build_zone_upload(self.zone_points), len(self.zone_points))
+
+    def _start_zone_transfer(self, commands: list[str], point_count: int) -> None:
+        if self._zone_transfer_active:
+            self._append_log("[ZONE] 危险区命令正在下发，已忽略重复点击")
+            return
+        if not self.connection or not self.connection.is_running:
+            self.zone_transfer_status_var.set("下发状态：未开始，串口尚未连接")
+            self.send_command(commands[0])
+            return
+
+        steps: list[tuple[str, str, str]] = [
+            (commands[0], "danger_zone cleared and disabled", "正在清空设备端旧区域"),
+        ]
+        for index, command in enumerate(commands[1:-2], start=1):
+            steps.append(
+                (
+                    command,
+                    "danger_zone add point=",
+                    f"正在发送第 {index}/{point_count} 个点",
+                )
+            )
+        steps.extend(
+            (
+                (commands[-2], "danger_zone set to on", "点位发送完成，正在启用危险区"),
+                (
+                    commands[-1],
+                    f"danger_zone enabled=on points={point_count}",
+                    "正在核对板端点数和启用状态",
+                ),
+            )
+        )
+
+        self._zone_transfer_generation += 1
+        self._zone_transfer_steps = steps
+        self._zone_transfer_index = 0
+        self._zone_transfer_waiting = False
+        self._zone_transfer_expected_points = point_count
+        self._zone_transfer_active = True
+        self._set_zone_actions_enabled(False)
+        self.zone_transfer_status_var.set(f"下发状态：已开始，共 {point_count} 个点")
+        self._append_log(f"[ZONE] 开始逐条下发危险区，共 {point_count} 个点")
+        self._send_zone_transfer_step(self._zone_transfer_generation)
+
+    def _send_zone_transfer_step(self, generation: int) -> None:
+        if not self._zone_transfer_active or generation != self._zone_transfer_generation:
+            return
+        if self._zone_transfer_index >= len(self._zone_transfer_steps):
+            self._complete_zone_transfer()
+            return
+
+        command, _expected, progress = self._zone_transfer_steps[self._zone_transfer_index]
+        self.zone_transfer_status_var.set(f"下发状态：{progress}")
+        self._append_log(
+            f"[ZONE][{self._zone_transfer_index + 1}/{len(self._zone_transfer_steps)}] {progress}"
+        )
+        self._zone_transfer_waiting = True
+        if not self.send_command(command, quiet=True):
+            self._fail_zone_transfer("串口未连接，命令未发送")
+            return
+        step_index = self._zone_transfer_index
+        self.root.after(
+            ZONE_STEP_TIMEOUT_MS,
+            lambda: self._zone_transfer_timeout(generation, step_index),
+        )
+
+    def _handle_zone_transfer_line(self, line: str) -> None:
+        if not self._zone_transfer_active or not self._zone_transfer_waiting:
+            return
+        cleaned = line.strip().lower()
+        if cleaned.startswith("[serial][error]"):
+            self._fail_zone_transfer("板端返回错误：" + line.strip())
+            return
+
+        _command, expected, _progress = self._zone_transfer_steps[self._zone_transfer_index]
+        if expected not in cleaned:
+            return
+
+        self._zone_transfer_waiting = False
+        completed_index = self._zone_transfer_index
+        self._zone_transfer_index += 1
+        if 1 <= completed_index <= self._zone_transfer_expected_points:
+            self.zone_transfer_status_var.set(
+                f"下发状态：板端已确认第 {completed_index}/{self._zone_transfer_expected_points} 个点"
+            )
+        else:
+            self.zone_transfer_status_var.set(
+                f"下发状态：已确认步骤 {completed_index + 1}/{len(self._zone_transfer_steps)}"
+            )
+        generation = self._zone_transfer_generation
+        self.root.after(
+            ZONE_STEP_DELAY_MS,
+            lambda: self._send_zone_transfer_step(generation),
+        )
+
+    def _zone_transfer_timeout(self, generation: int, step_index: int) -> None:
+        if (
+            not self._zone_transfer_active
+            or generation != self._zone_transfer_generation
+            or not self._zone_transfer_waiting
+            or step_index != self._zone_transfer_index
+        ):
+            return
+        command = self._zone_transfer_steps[step_index][0]
+        self._fail_zone_transfer(f"等待板端确认超时（{command}）")
+
+    def _complete_zone_transfer(self) -> None:
+        point_count = self._zone_transfer_expected_points
+        self._zone_transfer_active = False
+        self._zone_transfer_waiting = False
+        self._set_zone_actions_enabled(True)
+        self.zone_transfer_status_var.set(f"下发状态：成功，板端已启用 {point_count} 点危险区")
+        self._append_log(f"[ZONE][SUCCESS] 危险区下发完成，板端已启用 {point_count} 个点")
+
+    def _fail_zone_transfer(self, reason: str) -> None:
+        self._zone_transfer_generation += 1
+        self._zone_transfer_active = False
+        self._zone_transfer_waiting = False
+        self._set_zone_actions_enabled(True)
+        if hasattr(self, "zone_transfer_status_var"):
+            self.zone_transfer_status_var.set(f"下发状态：失败，{reason}；可重新点击“下发并启用”")
+        self._append_log(f"[ZONE][FAILED] {reason}")
+
+    def _set_zone_actions_enabled(self, enabled: bool) -> None:
+        state = "normal" if enabled else "disabled"
+        for button in getattr(self, "zone_action_buttons", []):
+            button.configure(state=state)
 
     def clear_zone(self) -> None:
         if not messagebox.askyesno("清空危险区域", "确定清空设备端和本地保存的危险区域吗？"):
@@ -1394,6 +1594,7 @@ class MainWindow:
         self._save_user_settings()
         self._update_zone_summary()
         self._draw_zone_preview()
+        self._pause_serial_polling(0.8)
         self.send_command("zone clear")
 
     def _draw_zone_preview(self) -> None:
@@ -1427,6 +1628,7 @@ class MainWindow:
                     "home_confirm_samples": self.home_controller.confirm_samples,
                     "home_release_seconds": self.home_controller.release_seconds,
                     "home_hold_seconds": self.home_controller.hold_seconds,
+                    "home_response_profile_version": HOME_RESPONSE_PROFILE_VERSION,
                     "home_gesture_mapping": {
                         str(gesture_class): action
                         for gesture_class, action in self.home_controller.mapping.items()

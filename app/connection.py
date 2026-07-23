@@ -10,6 +10,8 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Optional
 
+from .commands import validate_command
+
 
 @dataclass(frozen=True)
 class PortInfo:
@@ -384,9 +386,7 @@ class SerialConnection:
         self._thread.start()
 
     def send(self, command: str) -> None:
-        command = command.strip("\r\n")
-        if command:
-            self._tx_queue.put(command)
+        self._tx_queue.put(validate_command(command))
 
     def close(self) -> None:
         self._stop.set()
@@ -439,6 +439,7 @@ class SerialConnection:
                         serial_port.write(packet)
                         serial_port.flush()
                         self.stats.tx_bytes += len(packet)
+                        time.sleep(0.02)
                 except queue.Empty:
                     pass
 

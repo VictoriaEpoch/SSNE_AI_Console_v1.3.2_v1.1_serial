@@ -20,9 +20,17 @@ from .config import (
     REPO_COMMIT,
 )
 from .connection import PortInfo, SerialConnection, list_serial_ports
-from .monitoring import SedentaryMonitor, SedentaryState
+from .monitoring import NightRiseMonitor, NightRiseState, SedentaryMonitor, SedentaryState
 from .protocol import parse_line
 from .settings import load_settings, save_settings
+from .smart_home import (
+    ACTION_LABELS,
+    DEFAULT_GESTURE_MAPPING,
+    DEFAULT_HOLD_MAPPING,
+    DEVICE_LABELS,
+    HomeControlEvent,
+    SmartHomeController,
+)
 from .zone_editor import (
     ScreenRegionSelector,
     ZoneEditorDialog,
@@ -95,6 +103,73 @@ class MainWindow:
         self.sedentary_monitor = SedentaryMonitor(threshold_minutes * 60.0)
         self.sedentary_monitor.configure(sedentary_enabled, threshold_minutes * 60.0)
         self.sedentary_state = SedentaryState(False, 0.0)
+
+        night_enabled = bool(self.user_settings.get("night_rise_enabled", True))
+        night_start = str(self.user_settings.get("night_rise_start", "22:00"))
+        night_end = str(self.user_settings.get("night_rise_end", "06:00"))
+        night_lying_seconds = _as_float(self.user_settings.get("night_rise_lying_seconds"), 30.0)
+        night_rise_seconds = _as_float(self.user_settings.get("night_rise_confirm_seconds"), 2.0)
+        try:
+            self.night_rise_monitor = NightRiseMonitor(
+                start_time=night_start,
+                end_time=night_end,
+                lying_confirm_seconds=night_lying_seconds,
+                rise_confirm_seconds=night_rise_seconds,
+            )
+            self.night_rise_monitor.configure(
+                enabled=night_enabled,
+                start_time=night_start,
+                end_time=night_end,
+                lying_confirm_seconds=night_lying_seconds,
+                rise_confirm_seconds=night_rise_seconds,
+            )
+        except (TypeError, ValueError):
+            self.night_rise_monitor = NightRiseMonitor()
+            self.night_rise_monitor.configure(
+                enabled=night_enabled,
+                start_time="22:00",
+                end_time="06:00",
+                lying_confirm_seconds=30.0,
+                rise_confirm_seconds=2.0,
+            )
+        self.night_rise_state = self.night_rise_monitor.tick()
+
+        home_mapping = dict(DEFAULT_GESTURE_MAPPING)
+        raw_home_mapping = self.user_settings.get("home_gesture_mapping")
+        if isinstance(raw_home_mapping, dict):
+            for key, action in raw_home_mapping.items():
+                try:
+                    gesture_class = int(key)
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= gesture_class <= 4 and str(action) in ACTION_LABELS:
+                    home_mapping[gesture_class] = str(action)
+        home_hold_mapping = dict(DEFAULT_HOLD_MAPPING)
+        raw_home_hold_mapping = self.user_settings.get("home_hold_mapping")
+        if isinstance(raw_home_hold_mapping, dict):
+            for key, action in raw_home_hold_mapping.items():
+                try:
+                    gesture_class = int(key)
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= gesture_class <= 4 and str(action) in ACTION_LABELS:
+                    home_hold_mapping[gesture_class] = str(action)
+        try:
+            self.home_controller = SmartHomeController(
+                enabled=bool(self.user_settings.get("home_enabled", True)),
+                minimum_score=_as_float(self.user_settings.get("home_minimum_score"), 0.75),
+                confirm_samples=_as_int(self.user_settings.get("home_confirm_samples"), 2),
+                release_seconds=_as_float(self.user_settings.get("home_release_seconds"), 1.0),
+                mapping=home_mapping,
+                hold_seconds=_as_float(self.user_settings.get("home_hold_seconds"), 2.5),
+                hold_mapping=home_hold_mapping,
+            )
+        except (TypeError, ValueError):
+            self.home_controller = SmartHomeController(
+                hold_seconds=2.5,
+                hold_mapping=DEFAULT_HOLD_MAPPING,
+            )
+        self.home_last_status_frame: Optional[int] = None
         self.zone_points = self._load_zone_points(self.user_settings.get("zone_points"))
         self.zone_screenshot = None
 
@@ -163,7 +238,7 @@ class MainWindow:
         shell = ttk.Frame(self.root, style="Bg.TFrame", padding=(22, 18))
         shell.pack(fill="both", expand=True)
         ttk.Label(shell, text="SSNE 多任务监测上位机", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(shell, text=f"参考板端 UART 协议 · 久坐 / 跌倒 / 危险区 / 人脸 / 手势 · {REPO_COMMIT[:8]}", style="Muted.TLabel").pack(anchor="w", pady=(3, 14))
+        ttk.Label(shell, text=f"参考板端 UART 协议 · 久坐 / 起夜 / 跌倒 / 危险区 / 人脸 / 手势家居 · {REPO_COMMIT[:8]}", style="Muted.TLabel").pack(anchor="w", pady=(3, 14))
 
         self.tabs = ttk.Notebook(shell)
         self.tabs.pack(fill="both", expand=True)
@@ -171,16 +246,19 @@ class MainWindow:
         self.serial_page = ttk.Frame(self.tabs, style="Bg.TFrame", padding=16)
         self.control_page = ttk.Frame(self.tabs, style="Bg.TFrame", padding=16)
         self.safety_page = ttk.Frame(self.tabs, style="Bg.TFrame", padding=16)
+        self.home_page = ttk.Frame(self.tabs, style="Bg.TFrame", padding=16)
         self.log_page = ttk.Frame(self.tabs, style="Bg.TFrame", padding=16)
         self.tabs.add(self.dashboard, text="运行总览")
         self.tabs.add(self.serial_page, text="串口连接")
         self.tabs.add(self.control_page, text="设备控制")
-        self.tabs.add(self.safety_page, text="安全告警")
+        self.tabs.add(self.safety_page, text="姿态控制")
+        self.tabs.add(self.home_page, text="智能家居")
         self.tabs.add(self.log_page, text="日志终端")
         self._build_dashboard()
         self._build_serial_page()
         self._build_control_page()
         self._build_safety_page(threshold_minutes, sedentary_enabled)
+        self._build_home_page()
         self._build_log_page()
 
     def _card(self, master, title: str):
@@ -198,7 +276,7 @@ class MainWindow:
     def _build_dashboard(self) -> None:
         for column in range(5):
             self.dashboard.columnconfigure(column, weight=1)
-        for index, title in enumerate(("人员状态", "姿态 / 久坐", "跌倒状态", "危险区域", "设备帧率")):
+        for index, title in enumerate(("人员状态", "姿态 / 起夜", "跌倒状态", "危险区域", "设备帧率")):
             card, value = self._metric(self.dashboard, title)
             card.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 5, 0 if index == 4 else 5))
             setattr(self, ("m_person", "m_posture", "m_fall", "m_zone", "m_fps")[index], value)
@@ -227,6 +305,7 @@ class MainWindow:
             ("face_name", "识别身份"),
             ("posture", "当前姿态"),
             ("sedentary", "连续坐姿"),
+            ("night_rise", "起夜监测"),
             ("danger", "危险区人员 / 宠物"),
             ("gesture", "稳定手势"),
             ("gesture_score", "手势分数"),
@@ -283,7 +362,7 @@ class MainWindow:
         note.pack(fill="x", pady=(18, 0))
         ttk.Label(
             note,
-            text="115200 8-N-1，命令按行发送。程序优先使用 pyserial；未安装时在 Windows 上直接调用系统 COM 接口。连接后每秒读取 status；启用久坐监测时还会读取 debug 姿态字段。",
+            text="115200 8-N-1，命令按行发送。程序优先使用 pyserial；未安装时在 Windows 上直接调用系统 COM 接口。连接后每秒读取 status；久坐或起夜监测需要时还会读取 debug 姿态字段。",
             style="Panel2Muted.TLabel",
             wraplength=980,
             justify="left",
@@ -351,14 +430,22 @@ class MainWindow:
         ttk.Button(row, text="停止", command=lambda: self.send_command("test stop")).pack(side="left")
 
     def _build_safety_page(self, threshold_minutes: float, sedentary_enabled: bool) -> None:
-        self.safety_page.columnconfigure(0, weight=0, minsize=390)
+        self.safety_page.columnconfigure(0, weight=0, minsize=420)
         self.safety_page.columnconfigure(1, weight=1)
         self.safety_page.rowconfigure(0, weight=1)
 
         left = ttk.Frame(self.safety_page, style="Bg.TFrame")
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        sedentary = self._card(left, "久坐监测")
-        sedentary.pack(fill="x")
+
+        posture = self._card(left, "姿态告警")
+        posture.pack(fill="x")
+        self.posture_tabs = ttk.Notebook(posture, height=235)
+        self.posture_tabs.pack(fill="x")
+        sedentary = ttk.Frame(self.posture_tabs, style="Panel.TFrame", padding=12)
+        night_rise = ttk.Frame(self.posture_tabs, style="Panel.TFrame", padding=12)
+        self.posture_tabs.add(sedentary, text="久坐")
+        self.posture_tabs.add(night_rise, text="起夜")
+
         self.sedentary_enabled_var = tk.BooleanVar(value=sedentary_enabled)
         ttk.Checkbutton(
             sedentary,
@@ -383,53 +470,78 @@ class MainWindow:
             justify="left",
         ).pack(anchor="w", pady=(8, 0))
 
-        zone = self._card(left, "危险区域控制")
-        zone.pack(fill="x", pady=(12, 0))
+        self.night_rise_enabled_var = tk.BooleanVar(value=self.night_rise_monitor.enabled)
+        ttk.Checkbutton(
+            night_rise,
+            text="启用起夜告警",
+            variable=self.night_rise_enabled_var,
+            command=self.apply_night_rise_settings,
+        ).pack(anchor="w")
+        schedule = ttk.Frame(night_rise, style="Panel.TFrame")
+        schedule.pack(fill="x", pady=(8, 0))
+        ttk.Label(schedule, text="夜间时段", style="PanelMuted.TLabel").pack(side="left")
+        self.night_rise_start_var = tk.StringVar(value=NightRiseMonitor.format_clock(self.night_rise_monitor.start_minute))
+        self.night_rise_end_var = tk.StringVar(value=NightRiseMonitor.format_clock(self.night_rise_monitor.end_minute))
+        ttk.Entry(schedule, textvariable=self.night_rise_start_var, width=7).pack(side="left", padx=(8, 3))
+        ttk.Label(schedule, text="至", style="PanelMuted.TLabel").pack(side="left")
+        ttk.Entry(schedule, textvariable=self.night_rise_end_var, width=7).pack(side="left", padx=(3, 0))
+        confirm = ttk.Frame(night_rise, style="Panel.TFrame")
+        confirm.pack(fill="x", pady=(8, 0))
+        ttk.Label(confirm, text="躺卧确认(秒)", style="PanelMuted.TLabel").pack(side="left")
+        self.night_rise_lying_var = tk.StringVar(value=f"{self.night_rise_monitor.lying_confirm_seconds:g}")
+        ttk.Entry(confirm, textvariable=self.night_rise_lying_var, width=7).pack(side="left", padx=(6, 10))
+        ttk.Label(confirm, text="起身确认(秒)", style="PanelMuted.TLabel").pack(side="left")
+        self.night_rise_confirm_var = tk.StringVar(value=f"{self.night_rise_monitor.rise_confirm_seconds:g}")
+        ttk.Entry(confirm, textvariable=self.night_rise_confirm_var, width=7).pack(side="left", padx=(6, 0))
+        actions = ttk.Frame(night_rise, style="Panel.TFrame")
+        actions.pack(fill="x", pady=(8, 0))
+        ttk.Button(actions, text="应用", command=self.apply_night_rise_settings).pack(side="left")
+        ttk.Button(actions, text="重新布防", command=self.reset_night_rise).pack(side="left", padx=(6, 0))
+        self.night_rise_status_var = tk.StringVar(value="等待夜间躺卧姿态")
+        ttk.Label(night_rise, textvariable=self.night_rise_status_var, style="PanelMuted.TLabel", wraplength=355).pack(anchor="w", pady=(8, 0))
+
+        mode_note = self._card(left, "姿态运行模式")
+        mode_note.pack(fill="x", pady=(12, 0))
         ttk.Button(
-            zone,
+            mode_note,
             text="进入 ALL 安全监测模式",
             style="Primary.TButton",
             command=lambda: self.send_command("all"),
         ).pack(fill="x", pady=(0, 9))
         ttk.Label(
-            zone,
-            text="同时运行久坐姿态与危险区检测需要板端处于 ALL 模式。",
+            mode_note,
+            text="同时运行久坐、起夜姿态与危险区检测需要板端处于 ALL 模式。",
             style="PanelMuted.TLabel",
-            wraplength=340,
+            wraplength=355,
         ).pack(anchor="w", pady=(0, 8))
-        self.zone_device_status_var = tk.StringVar(value="设备区域状态：未知")
-        ttk.Label(zone, textvariable=self.zone_device_status_var, style="PanelMuted.TLabel", wraplength=340).pack(anchor="w")
-        buttons = ttk.Frame(zone, style="Panel.TFrame")
-        buttons.pack(fill="x", pady=(10, 0))
-        for index, (label, command) in enumerate(
-            (("下发并启用", self._send_zone_points), ("启用", lambda: self.send_command("zone on")), ("停用", lambda: self.send_command("zone off")), ("查询", lambda: self.send_command("zone list")))
-        ):
-            ttk.Button(buttons, text=label, style="Primary.TButton" if index == 0 else "TButton", command=command).grid(row=index // 2, column=index % 2, sticky="ew", padx=3, pady=3)
-        buttons.columnconfigure((0, 1), weight=1)
-        ttk.Button(zone, text="清空设备与本地区域", style="Danger.TButton", command=self.clear_zone).pack(fill="x", pady=(7, 0))
 
-        status = self._card(left, "告警字段")
-        status.pack(fill="both", expand=True, pady=(12, 0))
-        self.safety_fields_var = tk.StringVar(value="dza=--  pza=--  dzh=--  pzh=--")
-        ttk.Label(status, textvariable=self.safety_fields_var, style="PanelMuted.TLabel", wraplength=340, justify="left").pack(anchor="w")
-        ttk.Label(
-            status,
-            text="dza：人员进入危险区；pza：猫/狗进入危险区；板端按目标框底边中心（落脚点）判定。",
-            style="PanelMuted.TLabel",
-            wraplength=340,
-            justify="left",
-        ).pack(anchor="w", pady=(8, 0))
-
-        right = self._card(self.safety_page, "画面截取与多边形")
+        right = self._card(self.safety_page, "姿态控制 > 危险区域画面与多边形")
         right.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        self.zone_device_status_var = tk.StringVar(value="设备区域状态：未知")
+        ttk.Label(right, textvariable=self.zone_device_status_var, style="PanelMuted.TLabel", wraplength=820).pack(anchor="w")
+        buttons = ttk.Frame(right, style="Panel.TFrame")
+        buttons.pack(fill="x", pady=(8, 8))
+        for index, (label, command) in enumerate(
+            (
+                ("下发并启用", self._send_zone_points),
+                ("启用", lambda: self.send_command("zone on")),
+                ("停用", lambda: self.send_command("zone off")),
+                ("查询", lambda: self.send_command("zone list")),
+                ("清空区域", self.clear_zone),
+            )
+        ):
+            style = "Primary.TButton" if index == 0 else ("Danger.TButton" if index == 4 else "TButton")
+            ttk.Button(buttons, text=label, style=style, command=command).pack(side="left", expand=True, fill="x", padx=3)
+        self.safety_fields_var = tk.StringVar(value="dza=--  pza=--  dzh=--  pzh=--")
+        ttk.Label(right, textvariable=self.safety_fields_var, style="PanelMuted.TLabel", wraplength=820, justify="left").pack(anchor="w")
         ttk.Label(
             right,
-            text="先在桌面上框选完整的设备视频画面，再在截图中逐点绘制危险区。顶点会转换为 0~1 归一化坐标发送给设备。",
+            text="先框选完整设备视频画面，再逐点绘制危险区。dza 表示人员进入，pza 表示猫/狗进入；板端按目标框底边中心判定。",
             style="PanelMuted.TLabel",
             wraplength=820,
             justify="left",
-        ).pack(anchor="w", pady=(0, 10))
-        self.zone_preview = tk.Canvas(right, bg="#050912", highlightthickness=1, highlightbackground=COLORS["border"], height=470)
+        ).pack(anchor="w", pady=(5, 8))
+        self.zone_preview = tk.Canvas(right, bg="#050912", highlightthickness=1, highlightbackground=COLORS["border"], height=250)
         self.zone_preview.pack(fill="both", expand=True)
         self.zone_preview.bind("<Configure>", lambda _event: self._draw_zone_preview())
         self.zone_points_var = tk.StringVar()
@@ -440,6 +552,215 @@ class MainWindow:
         ttk.Button(bar, text="导入截图", command=self.import_zone_screenshot).pack(side="left", expand=True, fill="x", padx=4)
         ttk.Button(bar, text="编辑多边形", command=self.edit_zone_polygon).pack(side="left", expand=True, fill="x", padx=(4, 0))
         self._update_zone_summary()
+
+    def _build_home_page(self) -> None:
+        self.home_page.columnconfigure(0, weight=0, minsize=445)
+        self.home_page.columnconfigure(1, weight=1)
+        self.home_page.rowconfigure(0, weight=1)
+
+        settings_shell = ttk.Frame(self.home_page, style="Bg.TFrame")
+        settings_shell.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        settings_shell.columnconfigure(0, weight=1)
+        settings_shell.rowconfigure(0, weight=1)
+        settings_canvas = tk.Canvas(
+            settings_shell,
+            width=420,
+            bg=COLORS["bg"],
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        settings_scrollbar = ttk.Scrollbar(settings_shell, orient="vertical", command=settings_canvas.yview)
+        settings_canvas.configure(yscrollcommand=settings_scrollbar.set)
+        settings_canvas.grid(row=0, column=0, sticky="nsew")
+        settings_scrollbar.grid(row=0, column=1, sticky="ns")
+        settings = self._card(settings_canvas, "手势控制设置")
+        settings_window = settings_canvas.create_window((0, 0), window=settings, anchor="nw")
+        settings.bind(
+            "<Configure>",
+            lambda _event: settings_canvas.configure(scrollregion=settings_canvas.bbox("all")),
+        )
+        settings_canvas.bind(
+            "<Configure>",
+            lambda event: settings_canvas.itemconfigure(settings_window, width=event.width),
+        )
+        settings_canvas.bind(
+            "<MouseWheel>",
+            lambda event: settings_canvas.yview_scroll(int(-event.delta / 120), "units"),
+        )
+        self.home_enabled_var = tk.BooleanVar(value=self.home_controller.enabled)
+        ttk.Checkbutton(
+            settings,
+            text="启用手势模拟家居控制",
+            variable=self.home_enabled_var,
+            command=self.apply_home_settings,
+        ).pack(anchor="w")
+        ttk.Label(
+            settings,
+            text="同一个手势可分别绑定轻触和长按动作：松手执行轻触，持续保持执行长按。",
+            style="PanelMuted.TLabel",
+            wraplength=390,
+            justify="left",
+        ).pack(anchor="w", pady=(6, 12))
+
+        tuning = ttk.Frame(settings, style="Panel.TFrame")
+        tuning.pack(fill="x")
+        self.home_minimum_score_var = tk.StringVar(value=f"{self.home_controller.minimum_score:g}")
+        self.home_confirm_samples_var = tk.StringVar(value=str(self.home_controller.confirm_samples))
+        self.home_release_seconds_var = tk.StringVar(value=f"{self.home_controller.release_seconds:g}")
+        self.home_hold_seconds_var = tk.StringVar(value=f"{self.home_controller.hold_seconds:g}")
+        for column, (label, variable, width) in enumerate(
+            (
+                ("分数阈值", self.home_minimum_score_var, 8),
+                ("连续确认次数", self.home_confirm_samples_var, 8),
+                ("松手释放(秒)", self.home_release_seconds_var, 8),
+                ("长按(秒)", self.home_hold_seconds_var, 8),
+            )
+        ):
+            group = ttk.Frame(tuning, style="Panel.TFrame")
+            group.grid(row=0, column=column, sticky="ew", padx=(0 if column == 0 else 5, 0))
+            tuning.columnconfigure(column, weight=1)
+            ttk.Label(group, text=label, style="PanelMuted.TLabel").pack(anchor="w")
+            ttk.Entry(group, textvariable=variable, width=width).pack(fill="x", pady=(4, 0))
+
+        ttk.Separator(settings).pack(fill="x", pady=14)
+        ttk.Label(settings, text="手势的轻触 / 长按映射", style="Panel.TLabel", font=("Microsoft YaHei UI", 10, "bold")).pack(anchor="w")
+        self.home_action_by_label = {label: action for action, label in ACTION_LABELS.items()}
+        self.home_mapping_vars: dict[int, tk.StringVar] = {}
+        self.home_hold_mapping_vars: dict[int, tk.StringVar] = {}
+        action_labels = tuple(ACTION_LABELS.values())
+        mapping_grid = ttk.Frame(settings, style="Panel.TFrame")
+        mapping_grid.pack(fill="x", pady=(7, 0))
+        mapping_grid.columnconfigure(1, weight=1)
+        mapping_grid.columnconfigure(2, weight=1)
+        ttk.Label(mapping_grid, text="板端类别", style="PanelMuted.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 7))
+        ttk.Label(mapping_grid, text="轻触动作", style="PanelMuted.TLabel").grid(row=0, column=1, sticky="w", padx=(0, 5))
+        ttk.Label(mapping_grid, text="长按动作", style="PanelMuted.TLabel").grid(row=0, column=2, sticky="w", padx=(5, 0))
+        for gesture_class in range(5):
+            row = gesture_class + 1
+            ttk.Label(mapping_grid, text=GESTURES[gesture_class].split(" / ")[0], style="Panel.TLabel").grid(
+                row=row, column=0, sticky="w", padx=(0, 7), pady=(5, 0)
+            )
+            action = self.home_controller.mapping.get(gesture_class, "none")
+            variable = tk.StringVar(value=ACTION_LABELS[action])
+            self.home_mapping_vars[gesture_class] = variable
+            ttk.Combobox(
+                mapping_grid,
+                textvariable=variable,
+                values=action_labels,
+                state="readonly",
+                width=16,
+            ).grid(row=row, column=1, sticky="ew", padx=(0, 5), pady=(5, 0))
+            hold_action = self.home_controller.hold_mapping.get(gesture_class, "none")
+            hold_variable = tk.StringVar(value=ACTION_LABELS[hold_action])
+            self.home_hold_mapping_vars[gesture_class] = hold_variable
+            ttk.Combobox(
+                mapping_grid,
+                textvariable=hold_variable,
+                values=action_labels,
+                state="readonly",
+                width=16,
+            ).grid(row=row, column=2, sticky="ew", padx=(5, 0), pady=(5, 0))
+
+        actions = ttk.Frame(settings, style="Panel.TFrame")
+        actions.pack(fill="x", pady=(14, 0))
+        ttk.Button(actions, text="应用设置", style="Primary.TButton", command=self.apply_home_settings).pack(side="left", fill="x", expand=True, padx=(0, 4))
+        ttk.Button(actions, text="恢复丰富预设", command=self.reset_home_mapping).pack(side="left", fill="x", expand=True, padx=(4, 0))
+
+        modes = ttk.Frame(settings, style="Panel.TFrame")
+        modes.pack(fill="x", pady=(10, 0))
+        ttk.Button(modes, text="进入 HAND 模式", command=lambda: self.send_command("hand")).pack(side="left", fill="x", expand=True, padx=(0, 4))
+        ttk.Button(modes, text="进入 ALL 模式", command=lambda: self.send_command("all")).pack(side="left", fill="x", expand=True, padx=(4, 0))
+
+        self.home_current_gesture_var = tk.StringVar(value="等待板端手势数据")
+        self.home_trigger_status_var = tk.StringVar(value="防误触机制尚未收到样本")
+        ttk.Label(settings, textvariable=self.home_current_gesture_var, style="Panel.TLabel", font=("Microsoft YaHei UI", 10, "bold"), wraplength=390).pack(anchor="w", pady=(14, 0))
+        ttk.Label(settings, textvariable=self.home_trigger_status_var, style="PanelMuted.TLabel", wraplength=390, justify="left").pack(anchor="w", pady=(5, 0))
+        self.home_hold_progress_var = tk.DoubleVar(value=0.0)
+        ttk.Progressbar(settings, variable=self.home_hold_progress_var, maximum=100).pack(fill="x", pady=(7, 0))
+
+        right = ttk.Frame(self.home_page, style="Bg.TFrame")
+        right.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(1, weight=1)
+
+        devices = self._card(right, "模拟设备状态")
+        devices.grid(row=0, column=0, sticky="ew")
+        device_grid = ttk.Frame(devices, style="Panel.TFrame")
+        device_grid.pack(fill="x")
+        for column in range(3):
+            device_grid.columnconfigure(column, weight=1)
+        self.home_device_state_labels: dict[str, tk.Label] = {}
+        for index, (device, label) in enumerate(DEVICE_LABELS.items()):
+            row = index // 3
+            column = index % 3
+            card = ttk.Frame(device_grid, style="Panel2.TFrame", padding=(12, 10))
+            card.grid(
+                row=row,
+                column=column,
+                sticky="nsew",
+                padx=(0 if column == 0 else 4, 0 if column == 2 else 4),
+                pady=(0 if row == 0 else 8, 0),
+            )
+            ttk.Label(card, text=label, style="Panel2Muted.TLabel").pack(anchor="w")
+            state_label = tk.Label(
+                card,
+                text="--",
+                bg=COLORS["panel2"],
+                fg=COLORS["muted"],
+                font=("Microsoft YaHei UI", 13, "bold"),
+            )
+            state_label.pack(anchor="w", pady=(5, 8))
+            self.home_device_state_labels[device] = state_label
+            action_by_device = {
+                "living_light": "toggle_living_light",
+                "bedroom_light": "toggle_bedroom_light",
+                "curtain": "toggle_curtain",
+                "air_conditioner": "toggle_ac",
+                "television": "toggle_tv",
+            }
+            ttk.Button(
+                card,
+                text="手动切换",
+                command=lambda selected=action_by_device[device]: self._manual_home_action(selected),
+            ).pack(fill="x")
+
+        scene_bar = ttk.Frame(devices, style="Panel.TFrame")
+        scene_bar.pack(fill="x", pady=(10, 0))
+        for column, (label, action) in enumerate(
+            (
+                ("回家", "home_scene"),
+                ("离家", "away_scene"),
+                ("观影", "movie_scene"),
+                ("阅读", "reading_scene"),
+                ("睡眠", "sleep_scene"),
+            )
+        ):
+            scene_bar.columnconfigure(column, weight=1)
+            ttk.Button(
+                scene_bar,
+                text=f"{label}场景",
+                style="Primary.TButton" if column == 0 else "TButton",
+                command=lambda selected=action: self._manual_home_action(selected),
+            ).grid(row=0, column=column, sticky="ew", padx=(0 if column == 0 else 4, 0))
+
+        history = self._card(right, "控制记录（仅本次运行）")
+        history.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
+        ttk.Label(
+            history,
+            text="手势动作只更改上位机中的模拟设备，不会向真实家电发送指令。",
+            style="PanelMuted.TLabel",
+        ).pack(anchor="w", pady=(0, 8))
+        self.home_history = ttk.Treeview(history, columns=("time", "source", "action", "result"), show="headings", height=8)
+        for column, title, width in (
+            ("time", "时间", 90),
+            ("source", "来源", 120),
+            ("action", "动作", 155),
+            ("result", "结果", 310),
+        ):
+            self.home_history.heading(column, text=title)
+            self.home_history.column(column, width=width, anchor="w")
+        self.home_history.pack(fill="both", expand=True)
+        self._update_home_device_cards()
 
     def _build_log_page(self) -> None:
         bar = ttk.Frame(self.log_page, style="Bg.TFrame")
@@ -515,6 +836,8 @@ class MainWindow:
         self._set_controls_connected(False)
         self._set_link("未连接", COLORS["muted"])
         self.sedentary_monitor.reset()
+        self.night_rise_monitor.reset()
+        self.night_rise_state = self.night_rise_monitor.tick()
 
     def _set_controls_connected(self, connected: bool) -> None:
         self.port_combo.configure(state="disabled" if connected else "readonly")
@@ -547,7 +870,7 @@ class MainWindow:
         elif state == "opened":
             self._set_link("串口已打开", COLORS["cyan"])
             self.root.after(250, lambda: self.send_command("status", quiet=True))
-            if self.sedentary_enabled_var.get():
+            if self._posture_poll_required():
                 self.root.after(350, lambda: self.send_command("debug", quiet=True))
         elif state == "error":
             self._set_link("连接失败", COLORS["danger"])
@@ -568,13 +891,20 @@ class MainWindow:
             self.last_status_at = time.monotonic()
             self._set_link("设备在线", COLORS["success"])
             if event.kind == "debug":
-                self._observe_sedentary(event.data)
-            elif not _as_bool(self.current_status.get("person_active")):
-                self.sedentary_state = self.sedentary_monitor.observe(
-                    person_active=False,
-                    posture_class=None,
-                    posture_valid=False,
-                )
+                self._observe_posture(event.data)
+            else:
+                self._observe_home_gesture(event.data)
+                if not _as_bool(self.current_status.get("person_active")):
+                    self.sedentary_state = self.sedentary_monitor.observe(
+                        person_active=False,
+                        posture_class=None,
+                        posture_valid=False,
+                    )
+                    self.night_rise_state = self.night_rise_monitor.observe(
+                        person_active=False,
+                        posture_class=None,
+                        posture_valid=False,
+                    )
             self._check_device_alerts()
             self._update_dashboard()
         elif event.kind == "error":
@@ -592,7 +922,7 @@ class MainWindow:
             self.current_status.update(event.data)
             self.root.after(100, lambda: self.send_command("status", quiet=True))
 
-    def _observe_sedentary(self, data: dict[str, object]) -> None:
+    def _observe_posture(self, data: dict[str, object]) -> None:
         posture_class = data.get("posture_class", data.get("sc"))
         try:
             posture = int(posture_class) if posture_class is not None else None
@@ -605,12 +935,130 @@ class MainWindow:
             posture_valid=valid,
         )
         self._process_sedentary_state(self.sedentary_state)
+        self.night_rise_state = self.night_rise_monitor.observe(
+            person_active=_as_bool(self.current_status.get("person_active")),
+            posture_class=posture,
+            posture_valid=valid,
+        )
+        self._process_night_rise_state(self.night_rise_state)
 
     def _process_sedentary_state(self, state: SedentaryState) -> None:
         self.sedentary_state = state
         if state.triggered:
             minutes = self.sedentary_monitor.threshold_seconds / 60.0
             self._raise_alert("久坐告警", f"连续坐姿已达到 {minutes:g} 分钟", "sedentary")
+
+    def _process_night_rise_state(self, state: NightRiseState) -> None:
+        self.night_rise_state = state
+        if state.triggered:
+            self._raise_alert("起夜告警", "夜间检测到人员由躺卧转为坐姿或站立", "night_rise")
+
+    def _observe_home_gesture(self, data: dict[str, object]) -> None:
+        frame = _as_int(data.get("frame", data.get("f", 0)))
+        if frame > 0 and frame == self.home_last_status_frame:
+            return
+        if frame > 0:
+            self.home_last_status_frame = frame
+        gesture = _as_int(data.get("gesture", data.get("gc", -1)), -1)
+        score = _as_float(data.get("gesture_score", data.get("gs", 0.0)))
+        gesture_text = GESTURES.get(gesture, "无有效手势")
+        self.home_current_gesture_var.set(f"当前：{gesture_text} · 分数 {score:.3f}")
+        event = self.home_controller.observe(gesture, score)
+        self.home_hold_progress_var.set(self.home_controller.hold_progress() * 100.0)
+        if not self.home_controller.enabled:
+            self.home_trigger_status_var.set("手势模拟控制已停用")
+        elif event is not None:
+            kind = "长按" if event.gesture_kind == "hold" else "轻触"
+            self.home_trigger_status_var.set(f"已执行{kind}：{event.action_label}；松手后可再次触发")
+        elif self.home_controller.active_class is not None:
+            active = self.home_controller.active_class
+            if self.home_controller.invalid_since is not None:
+                self.home_trigger_status_var.set(
+                    f"正在确认松手；持续 {self.home_controller.release_seconds:g} 秒后执行轻触或解除长按锁定"
+                )
+            elif self.home_controller.hold_triggered:
+                self.home_trigger_status_var.set("长按动作已触发；请松手解除锁定")
+            else:
+                progress = self.home_controller.hold_progress()
+                hold_action = self.home_controller.hold_mapping.get(active, "none")
+                self.home_trigger_status_var.set(
+                    f"已确认：现在松手执行轻触；继续保持 "
+                    f"{progress * self.home_controller.hold_seconds:.1f}/{self.home_controller.hold_seconds:g} 秒执行「{ACTION_LABELS[hold_action]}」"
+                )
+        elif not 0 <= gesture <= 4:
+            self.home_trigger_status_var.set("等待有效手势；持续松手后会解除同手势锁定")
+        elif score < self.home_controller.minimum_score:
+            self.home_trigger_status_var.set(f"分数低于阈值 {self.home_controller.minimum_score:g}，未计入确认")
+        elif gesture == self.home_controller.latched_class:
+            self.home_trigger_status_var.set("当前手势已锁定，不会重复执行")
+        else:
+            self.home_trigger_status_var.set(
+                f"连续确认 {self.home_controller.candidate_samples}/{self.home_controller.confirm_samples}"
+            )
+        if event is not None:
+            self._handle_home_event(event)
+
+    def apply_home_settings(self) -> None:
+        mapping = {
+            gesture_class: self.home_action_by_label.get(variable.get(), "none")
+            for gesture_class, variable in self.home_mapping_vars.items()
+        }
+        hold_mapping = {
+            gesture_class: self.home_action_by_label.get(variable.get(), "none")
+            for gesture_class, variable in self.home_hold_mapping_vars.items()
+        }
+        try:
+            self.home_controller.configure(
+                enabled=bool(self.home_enabled_var.get()),
+                minimum_score=float(self.home_minimum_score_var.get()),
+                confirm_samples=int(self.home_confirm_samples_var.get()),
+                release_seconds=float(self.home_release_seconds_var.get()),
+                mapping=mapping,
+                hold_seconds=float(self.home_hold_seconds_var.get()),
+                hold_mapping=hold_mapping,
+            )
+        except (TypeError, ValueError) as exc:
+            messagebox.showerror("设置无效", str(exc))
+            return
+        self.home_trigger_status_var.set("设置已应用，等待新的手势样本")
+        self._save_user_settings()
+        self._append_log("[SMART_HOME] 手势映射与防误触参数已更新")
+
+    def reset_home_mapping(self) -> None:
+        for gesture_class, action in DEFAULT_GESTURE_MAPPING.items():
+            self.home_mapping_vars[gesture_class].set(ACTION_LABELS[action])
+        for gesture_class, action in DEFAULT_HOLD_MAPPING.items():
+            self.home_hold_mapping_vars[gesture_class].set(ACTION_LABELS[action])
+        self.home_hold_seconds_var.set("2.5")
+        self.apply_home_settings()
+
+    def _manual_home_action(self, action: str) -> None:
+        self._handle_home_event(self.home_controller.execute(action, source="manual"))
+
+    def _handle_home_event(self, event: HomeControlEvent) -> None:
+        self._update_home_device_cards()
+        if event.source == "gesture" and event.gesture_class is not None:
+            gesture = GESTURES.get(event.gesture_class, f"类别 {event.gesture_class}")
+            kind = "长按" if event.gesture_kind == "hold" else "轻触"
+            source = f"{gesture} · {kind}"
+        else:
+            source = "手动"
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.home_history.insert("", 0, values=(timestamp, source, event.action_label, event.result))
+        children = self.home_history.get_children()
+        if len(children) > 200:
+            self.home_history.delete(*children[200:])
+        self._append_log(f"[SMART_HOME][{source}] {event.action_label}：{event.result}")
+
+    def _update_home_device_cards(self) -> None:
+        if not hasattr(self, "home_device_state_labels"):
+            return
+        for device, label in self.home_device_state_labels.items():
+            active = bool(self.home_controller.devices[device])
+            label.configure(
+                text=self.home_controller.device_state_text(device),
+                fg=COLORS["success"] if active else COLORS["muted"],
+            )
 
     def _check_device_alerts(self) -> None:
         danger = _as_bool(self.current_status.get("dza"))
@@ -654,10 +1102,15 @@ class MainWindow:
         self._append_log("> " + command)
         return True
 
+    def _posture_poll_required(self) -> bool:
+        return self.sedentary_monitor.enabled or (
+            self.night_rise_monitor.enabled and self.night_rise_monitor.is_in_schedule()
+        )
+
     def _status_poll(self) -> None:
         if not self._closing and self.connection is not None and self.connection.is_running:
             self.send_command("status", quiet=True)
-            if self.sedentary_enabled_var.get():
+            if self._posture_poll_required():
                 self.send_command("debug", quiet=True)
         if not self._closing:
             self.root.after(1000, self._status_poll)
@@ -669,7 +1122,11 @@ class MainWindow:
         if self.connection is not None and self.last_status_at and time.monotonic() - self.last_status_at > 3.2:
             self._set_link("串口开·无状态", COLORS["warning"])
         self._process_sedentary_state(self.sedentary_monitor.tick())
+        night_tick = self.night_rise_monitor.tick()
+        if not night_tick.in_schedule or not self.night_rise_state.in_schedule:
+            self.night_rise_state = night_tick
         self._update_sedentary_labels()
+        self._update_night_rise_label()
         if not self._closing:
             self.root.after(500, self._update_health)
 
@@ -681,10 +1138,12 @@ class MainWindow:
         posture_class = _as_int(status.get("posture_class", status.get("sc", -1)), -1)
         posture_valid = _as_bool(status.get("posture_valid", status.get("sv", 0)))
         posture_label, posture_color = POSTURE_STATUS.get(posture_class, ("等待姿态", "muted")) if posture_valid else ("等待姿态", "muted")
+        posture_details = []
         if self.sedentary_state.active:
-            posture_metric = f"{posture_label} {_format_duration(self.sedentary_state.elapsed_seconds)}"
-        else:
-            posture_metric = posture_label
+            posture_details.append(_format_duration(self.sedentary_state.elapsed_seconds))
+        if self.night_rise_state.armed:
+            posture_details.append("起夜布防")
+        posture_metric = posture_label + (" · " + " · ".join(posture_details) if posture_details else "")
         self.m_posture.configure(text=posture_metric, foreground=COLORS.get(posture_color, COLORS["text"]))
 
         fall = str(status.get("fall_status", status.get("fs", "--")))
@@ -718,6 +1177,7 @@ class MainWindow:
             "face_name": status.get("face_name", "--"),
             "posture": posture_label,
             "sedentary": _format_duration(self.sedentary_state.elapsed_seconds) if self.sedentary_state.active else "未计时",
+            "night_rise": self._night_rise_status_text(),
             "danger": f"{_as_int(status.get('dzh'))} / {_as_int(status.get('pzh'))}",
             "gesture": GESTURES.get(gesture, str(gesture)),
             "gesture_score": f"{_as_float(status.get('gesture_score', status.get('gs', 0))):.3f}",
@@ -735,11 +1195,12 @@ class MainWindow:
             f"{_as_int(status.get('dzn'))} 点 · 人员命中 {_as_int(status.get('dzh'))} · 宠物命中 {_as_int(status.get('pzh'))}"
         )
         self.safety_fields_var.set(
-            f"dza={_as_int(status.get('dza'))}  pza={_as_int(status.get('pza'))}\n"
-            f"dzt={_as_int(status.get('dzt'))}  dzh={_as_int(status.get('dzh'))}\n"
+            f"dza={_as_int(status.get('dza'))}  pza={_as_int(status.get('pza'))}  "
+            f"dzt={_as_int(status.get('dzt'))}  dzh={_as_int(status.get('dzh'))}  "
             f"pzt={_as_int(status.get('pzt'))}  pzh={_as_int(status.get('pzh'))}"
         )
         self._update_sedentary_labels()
+        self._update_night_rise_label()
 
     def _update_sedentary_labels(self) -> None:
         if not self.sedentary_enabled_var.get():
@@ -750,6 +1211,32 @@ class MainWindow:
         else:
             text = "等待有效 SITTING 姿态"
         self.sedentary_status_var.set(text)
+
+    def _night_rise_status_text(self) -> str:
+        state = self.night_rise_state
+        if not self.night_rise_monitor.enabled or state.phase == "disabled":
+            return "已停用"
+        if not state.in_schedule or state.phase == "outside_schedule":
+            start = NightRiseMonitor.format_clock(self.night_rise_monitor.start_minute)
+            end = NightRiseMonitor.format_clock(self.night_rise_monitor.end_minute)
+            return f"非监测时段（{start}-{end}）"
+        if state.phase == "confirming_lying":
+            return f"确认躺卧 {state.elapsed_seconds:.0f}/{self.night_rise_monitor.lying_confirm_seconds:g} 秒"
+        if state.phase == "armed" or state.armed and state.phase in {"no_person", "waiting_posture"}:
+            return "已布防，等待起身"
+        if state.phase == "confirming_rise":
+            return f"确认起身 {state.elapsed_seconds:.1f}/{self.night_rise_monitor.rise_confirm_seconds:g} 秒"
+        if state.phase == "alerted":
+            return "已触发，等待再次躺卧"
+        if state.phase == "no_person":
+            return "画面无人，等待躺卧"
+        if state.phase == "waiting_posture":
+            return "等待有效姿态"
+        return "等待躺卧后布防"
+
+    def _update_night_rise_label(self) -> None:
+        if hasattr(self, "night_rise_status_var"):
+            self.night_rise_status_var.set(self._night_rise_status_text())
 
     def enroll_face(self) -> None:
         try:
@@ -801,6 +1288,40 @@ class MainWindow:
         self.sedentary_state = SedentaryState(False, 0.0)
         self._update_sedentary_labels()
         self._append_log("[SETTINGS] 久坐计时已清零")
+
+    def apply_night_rise_settings(self) -> None:
+        try:
+            self.night_rise_monitor.configure(
+                enabled=self.night_rise_enabled_var.get(),
+                start_time=self.night_rise_start_var.get(),
+                end_time=self.night_rise_end_var.get(),
+                lying_confirm_seconds=float(self.night_rise_lying_var.get()),
+                rise_confirm_seconds=float(self.night_rise_confirm_var.get()),
+            )
+        except (TypeError, ValueError) as exc:
+            self.night_rise_enabled_var.set(self.night_rise_monitor.enabled)
+            self.night_rise_start_var.set(NightRiseMonitor.format_clock(self.night_rise_monitor.start_minute))
+            self.night_rise_end_var.set(NightRiseMonitor.format_clock(self.night_rise_monitor.end_minute))
+            self.night_rise_lying_var.set(f"{self.night_rise_monitor.lying_confirm_seconds:g}")
+            self.night_rise_confirm_var.set(f"{self.night_rise_monitor.rise_confirm_seconds:g}")
+            messagebox.showerror("起夜设置错误", str(exc))
+            return
+        self.night_rise_state = self.night_rise_monitor.tick()
+        self._save_user_settings()
+        self._update_night_rise_label()
+        start = NightRiseMonitor.format_clock(self.night_rise_monitor.start_minute)
+        end = NightRiseMonitor.format_clock(self.night_rise_monitor.end_minute)
+        self._append_log(
+            f"[SETTINGS] 起夜监测={'on' if self.night_rise_monitor.enabled else 'off'}，"
+            f"时段={start}-{end}，躺卧={self.night_rise_monitor.lying_confirm_seconds:g}s，"
+            f"起身={self.night_rise_monitor.rise_confirm_seconds:g}s"
+        )
+
+    def reset_night_rise(self) -> None:
+        self.night_rise_monitor.reset()
+        self.night_rise_state = self.night_rise_monitor.tick()
+        self._update_night_rise_label()
+        self._append_log("[SETTINGS] 起夜监测已重置，等待重新确认躺卧")
 
     def capture_zone_screenshot(self) -> None:
         if not pillow_available():
@@ -884,7 +1405,25 @@ class MainWindow:
                 {
                     "sedentary_enabled": bool(self.sedentary_enabled_var.get()) if hasattr(self, "sedentary_enabled_var") else True,
                     "sedentary_minutes": minutes,
+                    "night_rise_enabled": self.night_rise_monitor.enabled,
+                    "night_rise_start": NightRiseMonitor.format_clock(self.night_rise_monitor.start_minute),
+                    "night_rise_end": NightRiseMonitor.format_clock(self.night_rise_monitor.end_minute),
+                    "night_rise_lying_seconds": self.night_rise_monitor.lying_confirm_seconds,
+                    "night_rise_confirm_seconds": self.night_rise_monitor.rise_confirm_seconds,
                     "zone_points": [[x, y] for x, y in self.zone_points],
+                    "home_enabled": self.home_controller.enabled,
+                    "home_minimum_score": self.home_controller.minimum_score,
+                    "home_confirm_samples": self.home_controller.confirm_samples,
+                    "home_release_seconds": self.home_controller.release_seconds,
+                    "home_hold_seconds": self.home_controller.hold_seconds,
+                    "home_gesture_mapping": {
+                        str(gesture_class): action
+                        for gesture_class, action in self.home_controller.mapping.items()
+                    },
+                    "home_hold_mapping": {
+                        str(gesture_class): action
+                        for gesture_class, action in self.home_controller.hold_mapping.items()
+                    },
                 }
             )
         except OSError as exc:

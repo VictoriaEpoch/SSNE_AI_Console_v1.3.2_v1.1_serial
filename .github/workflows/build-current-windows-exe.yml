@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - agent/build-exe-20260726
+  pull_request:
+    branches:
+      - 第三版
   workflow_dispatch:
 
 permissions:

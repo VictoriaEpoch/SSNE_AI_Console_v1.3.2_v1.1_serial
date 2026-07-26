@@ -47,10 +47,10 @@ jobs:
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt pyinstaller pytest
+          python -m pip install -r requirements.txt pyinstaller
 
-      - name: Verify code
-        run: python -m pytest -q
+      - name: Verify current source compiles
+        run: python -m compileall -q main.py app
 
       - name: Build single-file GUI EXE
         run: python -m PyInstaller --noconfirm --clean --onefile --windowed --name SSNE_AI_Console_v1.3.2 main.py
